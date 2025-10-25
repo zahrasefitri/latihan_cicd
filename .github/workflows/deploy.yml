@@ -1,4 +1,4 @@
-name: lks_cicd
+name: CI/CD Docker to Elastic Beanstalk
 
 on:
   push:
@@ -10,50 +10,77 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "18"
 
       - name: Install dependencies
         run: npm install
 
-      - name: build zip
-        run: zip -r latihan-cicd.zip . -x "node_modules/*"
+      - name: Run build (optional)
+        run: npm run build --if-present
 
-      - name: Upload build artifacts
+      - name: Run tests (optional)
+        run: npm test --if-present
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build -t latihan-cicd .
+
+      - name: Save Docker image to tar file
+        run: docker save latihan-cicd -o latihan-cicd.tar
+
+      - name: Create Dockerrun.aws.json
+        run: |
+          echo '{
+            "AWSEBDockerrunVersion": 1,
+            "Image": {
+              "Name": "latihan-cicd",
+              "Update": "true"
+            },
+            "Ports": [
+              {
+                "ContainerPort": 3000
+              }
+            ]
+          }' > Dockerrun.aws.json
+
+      - name: Zip deployment package
+        run: zip deployment.zip Dockerfile Dockerrun.aws.json package.json index.js
+
+      - name: Upload artifact for deploy job
         uses: actions/upload-artifact@v4
         with:
-          name: latihan-cicd
-          path: latihan-cicd.zip
+          name: deployment-package
+          path: deployment.zip
 
-      - name: Configure AWS CLI
-        run: |
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
           aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws configure set aws_session_token ${{ secrets.AWS_SESSION_TOKEN }}
           aws configure set region ${{ secrets.AWS_REGION }}
 
       - name: Upload to S3
-        run: aws s3 cp "latihan-cicd.zip" "s3://${{ secrets.S3_BUCKET_NAME }}/latihan-cicd.zip"
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: latihan-cicd
+        run: aws s3 cp deployment.zip s3://${{ secrets.S3_BUCKET_NAME }}/deployment.zip
 
       - name: Deploy to Elastic Beanstalk
         env:
@@ -64,12 +91,13 @@ jobs:
           EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
           EB_ENV_NAME: ${{ secrets.EB_ENV_NAME }}
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         run: |
-          VERSION_LABEL="${{ github.sha }}-$(date +%s)"
+          VERSION_LABEL=${{ github.sha }}-$(date +%s)
           aws elasticbeanstalk create-application-version \
-             --application-name ${{ secrets.EB_APP_NAME }} \
-             --version-label $VERSION_LABEL \
-             --source-bundle S3Bucket=${{ secrets.S3_BUCKET_NAME }},S3Key=latihan-cicd.zip
+            --application-name "${{ secrets.EB_APP_NAME }}" \
+            --version-label $VERSION_LABEL \
+            --source-bundle S3Bucket=${{ secrets.AWS_S3_BUCKET_NAME }},S3Key=deployment.zip
           aws elasticbeanstalk update-environment \
-             --environment-name ${{ secrets.EB_ENV_NAME }} \
-             --version-label $VERSION_LABEL
+            --environment-name "${{ secrets.EB_ENV_NAME }}" \
+            --version-label $VERSION_LABEL
